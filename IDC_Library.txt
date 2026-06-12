@@ -1,0 +1,255 @@
+High-Level Architecture
+
+                 ┌────────────────────────┐
+                 │   React + Vite (5173)  │  ← TS, axios with credentials
+                 └───────────┬────────────┘
+                 HTTPS cookie (access_token, refresh_token)
+                             │
+                 ┌───────────▼────────────┐
+                 │   FastAPI (Uvicorn)    │
+                 │ ─ role_middleware      │  ← cookie → decode JWT → request.state
+                 │ ─ slowapi rate limiter │
+                 │ ─ CORS (credentialed)  │
+                 │ ─ Routers              │
+                 │   /auth /users /admin  │
+                 │   /books /categories   │
+                 │   /IssueBooks          │
+                 │   /EBooks /analytics   │
+                 └───┬──────────┬─────────┘
+                     │          │
+        Motor (async)│          │APScheduler (sync BG)
+                     ▼          ▼
+              ┌──────────┐  ┌─────────────────────┐
+              │ MongoDB  │  │ Daily cron @ 00:00  │
+              │ via      │  │ check_book_expiry…  │
+              │ Beanie   │  └──────────┬──────────┘
+              └────┬─────┘             │
+                   │                   ▼
+                   │             ┌───────────┐
+                   │             │ SendGrid  │  ← OTP, expiry, overdue, reset
+                   │             └───────────┘
+                   │
+                   ▼
+         ┌──────────────────┐
+         │ Azure Blob Store │  ← eBook PDFs (libebook container)
+         └──────────────────┘
+
+1.2 Component Breakdown
+Layer		Module									Responsibility
+Entry		app/main.py								lifespan init Motor client, init_beanie, registers routers, starts/stops scheduler
+Middleware	app/middleware/auth_middleware.py					role_middleware → reads access_token cookie, decodes JWT, hydrates request.state.{id, role, username}, enforces required_roles set by decorator
+Auth		app/api/auth.py, app/core/security.py					JWT (access/refresh), bcrypt, OTP flow, password reset (HMAC-SHA256 token)
+RBAC		app/middleware.auth_middleware.require_roles, app/core/authorization.py	Two parallel impls — decorator attaches required_roles; middleware enforces
+Domain Models	app/db/models/*								Beanie Document classes: User, Books, Category, BookIssues, BookIssuesRequest, RequestNewBooks, FeedBack, EmailOTP
+Business APIs	app/api/books.py, adminBooks.py, bookrequest.py				CRUD + request→approve→issue→return lifecycle
+Scheduler	app/core/scheduler.py							APScheduler BackgroundScheduler, daily 00:00 expiry check
+Storage		app/api/EBook.py							Azure Blob upload/preview/download/delete for PDFs
+Analytics	app/api/analytics.py							Mongo aggregation pipelines (issues/day, top-books, status, overdue, active-users)
+Rate Limiter	app/utils/rate_limiter.py						slowapi, IP-keyed, per-endpoint tiers (AUTH 5/min, WRITE 10/min, READ 60/min, SEARCH 30/min)
+Email		app/utils/email.py							SendGrid templates (OTP, reset, status, expiry, overdue)
+
+
+1.3 Data Flow — Issue-a-Book (end-to-end)
+1.	Search: User hits GET /books/search?title=... → role_middleware decodes cookie JWT → require_roles(["user","librarian","admin"]) (via request.scope.endpoint.required_roles) → Beanie regex query → serialize_book_for_user strips librarian-only fields.
+2.	Request: User posts POST /IssueBooks/request {bookId} → checks no existing pending BookIssuesRequest for (BookId, UserId) → inserts new request.
+3.	Approve (librarian): POST /IssueBooks/ApproveIssueBook → creates BookIssues doc with expiry_date → marks all other requests for that book as rejected (winner take all) → sets Books.isDrawn = True.
+4.	Cron @ 00:00: check_book_expiry_and_send_notifications scans BookIssues.status=="issued" → if days_until_expiry == 3 send first reminder, if days_after_expiry == 2 send overdue → flips boolean flags.
+5.	Return: User posts POST /IssueBooks/ReturnIssuedBook {issueId} → toggles Books.isDrawn=False, sets BookIssues.status="returned".
+
+
+1.4 Design Tradeoffs (actual ones in your code)
+
+Decision						Why									Cost
+
+Beanie ODM over raw Motor				Pydantic validation + typed Documents					Adds boilerplate (model_rebuild()) for forward refs (Books↔Category)
+Cookie-based JWT (httpOnly)				XSS safe, browser-managed						Requires CORS allow_credentials=True, CSRF risk (mitigated only by SameSite)
+Two JWT secrets (SECRET_KEY_ACCESS,SECRET_KEY_REFRESH)	Compromise of access secret doesn’t forge refresh tokens		Operational: two secrets to rotate
+BackgroundScheduler (sync) for an async task		Simple, no asyncio loop wiring						Bug: an async coroutine is scheduled but never awaited (see §5)
+Soft delete (isDeleted=True)				Audit & recovery							Every query must filter isDeleted:false (easy to miss)
+Pie chart server-rendered (matplotlib PNG stream)	No FE chart lib needed							Blocks event loop; not horizontally scalable
+Per-endpoint role decorator + central middleware	Centralized enforcement							Two require_roles symbols exist (decorator + dependency), causing confusion
+OTP verified_until window (10 min)			Decouples verify from register						Race: anyone with the email value can register inside the window
+
+
+1.5 Scalability Discussion
+•	Stateless API → horizontally scalable behind a load balancer (no in-process session).
+•	Mongo bottlenecks: no Indexed fields on book_id, username, BookIssues.UserId, BookIssues.status, BookIssuesRequest.status. All these are filtered/aggregated heavily → full collection scans at scale.
+•	Scheduler is a SPOF: BackgroundScheduler runs in-process → each API replica would fire the cron → duplicate notifications. Needs a distributed lock (Redis/Mongo) or a single dedicated worker.
+•	Rate limiter uses get_remote_address and in-memory storage → resets per replica. Must move to Redis backend (limits supports it) for cluster-wide enforcement.
+•	Analytics endpoints run aggregations on every request → cache (Redis 60s TTL) or precompute into a materialized collection.
+•	PDF download streams full blob into memory (download_blob().readall()) → swap for chunked iter_chunks() or generate SAS URLs so client downloads directly from Azure.
+
+
+1.6 Production-Level Improvements
+1.	Transactions for issue/approve flow (multi-document write across BookIssues, BookIssuesRequest, Books.isDrawn) — MongoDB replica-set txn.
+2.	Idempotency keys on /ApproveIssueBook (use requestId as natural idempotency anchor).
+3.	Compound indexes: {BookId:1, UserId:1, status:1} on BookIssuesRequest; {status:1, expiry_date:1} on BookIssues; unique {book_id:1} on Books; unique {username:1} on User.
+4.	CSRF token for state-changing cookie-auth routes (currently only SameSite=none — exposed to CSRF).
+5.	Refresh token rotation + revocation list (current refresh decode doesn’t check DB-stored token).
+6.	Replace BackgroundScheduler with AsyncIOScheduler OR run asyncio.run_coroutine_threadsafe (see §5 bug).
+7.	Structured logging (currently print(...) everywhere) → structlog + correlation ID middleware.
+8.	OpenTelemetry traces for Mongo + SendGrid + Azure spans.
+9.	Secrets → Azure Key Vault, not .env.
+10.	CI: pytest + ruff + mypy + dependabot; container scan (Trivy).
+
+
+---
+2️⃣ BACKEND ENGINEERING QUESTIONS
+
+Q1. Why FastAPI over Flask/Django?
+Answer: ASGI + native async/await so Mongo (Motor), SendGrid HTTP, Azure Blob calls don’t block. Pydantic v2 gives type-checked request/response with auto OpenAPI (/docs). FastAPI’s dependency-injection (Depends) made the auth boundary trivial—we mounted a single role_middleware and let endpoints declare roles via a decorator: @require_roles(["admin"]). Django would have forced an ORM mismatch with Mongo; Flask would have required hand-rolled async glue.
+
+Q2. Explain the dependency injection / authorization pattern.
+Answer: Two layers:
+1.	require_roles(roles) decorator just tags the endpoint: setattr(func, "required_roles", roles).
+2.	role_middleware (registered with app.middleware("http")) decodes the cookie JWT, attaches request.state.{id, role, username}, then introspects request.scope["endpoint"] to read the tag and enforce.
+This keeps the auth contract declarative at the route level while centralizing JWT decoding. Tradeoff: it’s middleware-based, not Depends-based, so you cannot mock it cleanly per-test with app.dependency_overrides.
+
+Q3. Async vs sync decisions in this codebase?
+Answer:
+•	Async: All Mongo operations (Motor/Beanie), the lifespan, all routes — required because Motor returns coroutines.
+•	Sync (intentional): SendGrid client (sg.send) — it’s a sync HTTP call inside an async route; that blocks the event loop. Should be wrapped in await asyncio.to_thread(...).
+•	Sync (accidental): matplotlib.pyplot.pie for analytics PNG and blob.download_blob().readall() for PDFs — both block; should be offloaded.
+•	APScheduler BackgroundScheduler runs on a separate thread pool but the job itself is async def — this is a bug (see §5).
+
+
+Q4. API design patterns used?
+•	Resource-oriented routers under prefixes (/books, /categories, /IssueBooks).
+•	Role-based response shaping: serialize_book_for_user vs serialize_book_for_librarian from app/helper/books.py — same DB doc, different DTO based on request.state.role.
+•	Soft delete (isDeleted) instead of hard delete.
+•	State machine in BookIssuesRequest: pending → approved | rejected, and BookIssues: issued → returned.
+•	Parallel fan-out for dashboards: app/api/admin.py:get_admin_counts uses asyncio.gather over 3 Mongo counts — the only place this is done well.
+
+
+Q5. Error handling strategy?
+Honest answer: It’s inconsistent. The dominant pattern is:
+try:
+    ...
+except HTTPException:
+    raise
+except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
+That leaks internal error messages to the client (security smell). Better: a single @app.exception_handler(Exception) that logs the traceback and returns a generic 500 with a correlation id.
+
+
+Q6. Why lifespan instead of @app.on_event("startup")?
+Answer: on_event is deprecated since FastAPI 0.93. @asynccontextmanager lifespan gives one place for both startup (open Motor client, init_beanie, start_scheduler) and shutdown (stop_scheduler, client.close()) and integrates with Starlette’s lifespan protocol.
+---
+
+
+3️⃣ DATABASE & DATA MODELING
+
+3.1 Schema Decisions
+Collection	Key fields	Modeling choice
+user	username (EmailStr, unique semantically), role, requested_role, approval_status, allowed, refresh_token, reset_token, reset_token_expiry	Single collection; admin/librarian approval mixed in same doc to avoid cross-collection joins
+Books	book_id (string), category (PydanticObjectId), bookTitle, author, isDeleted, isDrawn, dateDrawn, source	category is a manual ObjectId ref, not a Beanie Link → avoids automatic $lookup cost but loses populate convenience
+Categories	categoryName, code, color, booksInCategory: List[BackLink["Books"]]	Uses Beanie BackLink so category.numberOfBooks is computed; but only resolves when explicitly fetched with link — len(self.booksInCategory) is misleading otherwise
+BookIssuesRequest	BookId (string), UserId (PydanticObjectId), status, requestedOn	Type mismatch land-mine: BookId stored as str but Books.book_id is sometimes treated as int in books.py
+BookIssues	BookId, UserId, status, issuedOn, expiry_date, first_notification, second_notification	Notification booleans are denormalized into the issue doc — simple but means re-issuing same book has to reset flags
+RequestNewBooks	userId, requestedTitle, requestedAuthor, category, description, isSeen	isSeen is the read-receipt for librarians
+FeedBack	user, remarks, created_at	Append-only
+email_otps	email, otp_hash, expires_at, attempts, locked_until, verified, verified_until	Hashed OTP at rest (HMAC-SHA256 keyed)
+
+
+3.2 Indexing Strategy (current vs recommended)
+Current: Effectively none. The Indexed(unique=True) annotation appears only in app/helper/user.py:UserRegister — that’s a Pydantic schema, not the Beanie Document, so it has zero effect on Mongo. The actual User Document in app/db/models/user_model.py has no Indexed markers.
+Recommended:
+class User(Document):
+    username: Indexed(EmailStr, unique=True)
+    class Settings:
+        indexes = [
+            [("approval_status", 1), ("role", 1)],
+            [("reset_token", 1)],
+        ]
+class Books(Document):
+    book_id: Indexed(str, unique=True)
+    class Settings:
+        indexes = [
+            [("isDeleted", 1), ("isDrawn", 1)],
+            [("bookTitle", "text"), ("author", "text")],   # text search
+            [("category", 1)],
+        ]
+class BookIssues(Document):
+    class Settings:
+        indexes = [[("status", 1), ("expiry_date", 1)], [("UserId", 1)]]
+class BookIssuesRequest(Document):
+    class Settings:
+        indexes = [[("BookId", 1), ("UserId", 1), ("status", 1)]]
+class EmailOTP(Document):
+    class Settings:
+        indexes = [[("email", 1)], [("expires_at", 1)]]   # + TTL on expires_at
+TTL index on EmailOTP.expires_at would auto-purge stale docs.
+
+
+3.3 MongoDB Aggregation Logic (from app/api/analytics.py)
+
+a) Issues per day
+[ {$group: {_id: {day:{$dayOfMonth:"$issuedOn"}, month:{$month:"$issuedOn"}, year:{$year:"$issuedOn"}}, count:{$sum:1}}},
+  {$sort:{_id:1}} ]
+•	_id is a composite doc → sort key is the doc itself. Better: $dateToString: {format:"%Y-%m-%d", date:"$issuedOn"} for clean string keys.
+
+b) Top-N books
+[ {$group:{_id:"$BookId", count:{$sum:1}}}, {$sort:{count:-1}}, {$limit: limit} ]
+Then code does a per-row Books.find_one(...) in Python — N+1 problem. Should use $lookup:
+{$lookup:{from:"Books", localField:"_id", foreignField:"book_id", as:"book"}}
+
+c) Overdue distribution uses $$NOW aggregation variable — cleaner than passing datetime.utcnow() from Python (no clock skew between API host & DB).
+
+3.4 SQL vs Mongo tradeoffs (for this domain)
+Concern					SQL pick			Why Mongo was acceptable here
+ACID across issue+book+request		Strong				We need replica-set txns; not used currently
+Flexible review/feedback shapes		OK				Mongo handles evolving docs without migrations
+Reports / OLAP				Strong (JOINs, window fns)	We emulate with aggregation pipelines
+Read scaling				Replicas			Same
+Schema enforcement			Strong (DDL)			We enforce via Pydantic/Beanie at app layer
+
+For this library scale (thousands of books, hundreds of employees) Mongo is fine; at millions you’d want PostgreSQL or split OLAP into a warehouse.
+
+3.5 Performance bottlenecks (real)
+•	N+1 queries everywhere: GetAllIssuedBooks, GetAllIssueRequests, top-books, active-users, deletedList. Use $lookup.
+•	Books.find({"isDeleted":False}).to_list(length=None) returns all books into memory → pagination missing.
+•	bookrequest.py:get_user_requests does two full collection scans + per-book lookup.
+•	serialize_book_for_user awaits a Category.get per book → again N+1.
+---
+
+4️⃣ AUTHENTICATION & SECURITY
+
+
+4.1 JWT Implementation
+•	Two tokens, separately keyed (SECRET_KEY_ACCESS, SECRET_KEY_REFRESH), HS256 by default.
+•	Access token TTL = 30 min default; refresh = 10 days.
+•	Stored in httponly cookies; secure=True, samesite="none" — required for cross-site React dev origin.
+•	/auth/refresh decodes the refresh cookie and re-encodes the same payload as a new access token — meaning the new access token may carry the original exp from the refresh payload if not stripped. Verify: create_access_token(payload) calls add exp+iat but to_encode = data.copy(); to_encode.update({"exp":..., "iat":...}) — so it will overwrite. OK.
+Separate access and refresh secrets reduce blast radius if one secret is compromised.
+
+
+4.2 RBAC Design
+Three roles: user, librarian, admin (Literal[...]).
+•	Roles embedded in JWT (role claim) → no DB hit per request.
+•	Approval workflow: register with requested_role ∈ {librarian, admin} → stored as role="user", approval_status="pending", allowed=False. Admin calls POST /admin/approve_user/{username} → sets role = requested_role, allowed=True.
+•	Authorization check is in middleware reading request.scope["endpoint"].required_roles.
+
+
+4.3 OTP Flow Security (app/utils/otp.py, app/api/auth.py)
+•	6-digit numeric, 5-minute TTL, hashed with HMAC-SHA256 keyed by OTP_HASH_SECRET and the email.
+•	Brute-force protection: 5 attempts then 15-min lockout (locked_until).
+•	Constant-time compare via hmac.compare_digest.
+•	On successful verify → verified=True, verified_until = now + 10min. register_user requires this window.
+
+
+Weakness: verified window decouples verify from register, but nothing binds the verify event to the registering session (no nonce). An attacker who knows the email could race the legit user to the register endpoint within the 10-min window.
+
+4.4 Threat Modeling
+Attack	Vector	Current mitigation	Gap
+Credential stuffing	/auth/login	slowapi 5/min/IP	IP-based only; behind NAT all users share quota; no per-username throttle
+Brute-force OTP	/auth/verify-otp	5 attempts + lockout	Lockout only after attempts; rotating IP can bypass
+Token theft via XSS	Browser	httponly cookie	If XSS exists, attacker can still call any API from victim browser
+CSRF	Cookie-auth POSTs	SameSite=none ironically disables the cross-site CSRF protection because cookies are sent on cross-site requests	Need CSRF token (double-submit) or SameSite=lax + Authorization header
+Open redirect via reset link	/auth/forgot-password	None	FRONTEND_URL env-injected; if misconfigured leaks token
+Replay of reset token	/auth/reset-password	SHA-256 hash stored + 15-min expiry	OK; but token passed as query param → leaks to logs/proxies; should be POST body
+Privilege escalation	userLogin includes role from client	Server still looks up User.find_one({username,role}) — but matches any user with that role	A user can request login as librarian; if their stored role is user, lookup fails. OK but fragile — better: ignore client role entirely, return whatever DB says
+Domain bypass	Registration restricted to @fastenal.com	Validated in pydantic + endpoint	Subdomain bypass: evil.fastenal.com not blocked (split("@")[-1] matches exact) — actually OK because split → last segment must equal "fastenal.com"
+Information disclosure	Errors return str(e) to client	None	Wrap in generic handler
+JWT secret leakage	.env on disk	None	Use Key Vault
+---
+
