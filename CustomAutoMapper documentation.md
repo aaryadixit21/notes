@@ -19,6 +19,8 @@ DTO = Filtered export (only needed columns shared with someone)
 
 
 2\. Reflection
+
+
 Reflection is a feature that allows a program to inspect and manipulate its own structure at runtime. Libraries like AutoMapper use reflection to map one object to another. this is slow. at runtime we dont use reflection, use cached compiled delegates
 Reflection is slow because:
 
@@ -36,6 +38,8 @@ Can be inlined
 
 
 3\. expression tree
+
+
 An expression tree is a data structure that represents code as a tree.
 
 Reflection-based mapping would do this at runtime:
