@@ -6,7 +6,7 @@
 
 
 
-1. Entity and DTO
+1\. Entity and DTO
 
 An Entity is a class that represents a table in the database.
 
@@ -19,53 +19,46 @@ DTO = Filtered export (only needed columns shared with someone)
 
 
 2\. Reflection
-
 Reflection is a feature that allows a program to inspect and manipulate its own structure at runtime. Libraries like AutoMapper use reflection to map one object to another. this is slow. at runtime we dont use reflection, use cached compiled delegates
+Reflection is slow because:
 
+Method lookup
+Boxing/unboxing
+Method invocation overhead
+
+Mapping is a hot path → executed millions of times → so reflection must be avoided.
+
+Why are delegates faster?
+Delegates are direct function calls
+No metadata lookup
+JIT optimizable
+Can be inlined
 
 
 3\. expression tree
 An expression tree is a data structure that represents code as a tree.
 
-
-
 Reflection-based mapping would do this at runtime:
-
 propertyInfo.GetValue(source);
-
 propertyInfo.SetValue(destination, value);
 
-
-
 That is slower because reflection has overhead.
-
 Your library instead builds expression trees like:
 
-
-
 src => new Destination
-
 {
-
-&#x20;   Name = src.Name,
-
-&#x20;   Age = src.Age
-
+    Name = src.Name,
+    Age = src.Age
 }
 
-
-
 Then compiles them into delegates.
-
 expression trees are used in TypeMapSealer to build factories, setters, getters, direct-copy delegates, full map functions, and nested map functions.
-
-
 
 I used expression trees because they let me generate mapping code dynamically at configuration time and compile it into delegates. This avoids reflection on every map call and gives performance close to handwritten mapping while still supporting runtime configuration.
 
-
-
-
+.Compile() converts an expression tree into executable IL code using DynamicMethod.
+Expression → IL → JIT → native machine code
+This is expensive → so I do it once at configuration time, not during mapping.
 
 4\. Paths
 
